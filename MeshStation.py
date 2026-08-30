@@ -301,10 +301,16 @@ PRESET_ID_REVERSE = {v: k for k, v in PRESET_ID_MAP.items() if v is not None}
 # custom modem settings. Packet format reference:
 # https://github.com/meshcore-dev/MeshCore/blob/main/docs/packet_structure.md
 MESHCORE_REGION_DEFAULTS = {
-    # region_key: (freq_mhz, bw_khz, sf, cr)
-    "US":     (910.525, 250.0, 10, 5),
-    "EU_868": (869.525, 250.0, 11, 5),
+    # region_key: list of (freq_mhz, bw_khz, sf, cr) demod chains.
+    # First entry is the current recommended setting; extras catch nodes still
+    # on older settings. As of Oct 2025 most regions moved to "narrow"
+    # (BW 62.5, low SF) — see meshcore-dev/MeshCore docs/faq.md.
+    "US":     [(910.525, 62.5, 7, 5), (910.525, 250.0, 10, 5)],
+    "EU_868": [(869.525, 62.5, 7, 5), (869.525, 250.0, 11, 5)],
 }
+# Well-known MeshCore "Public" channel key (hash 0x11); the b64 form
+# izOH6cXN6mrJ5e26oRXNcg== appears in device UIs
+MESHCORE_PUBLIC_CHANNEL_KEY = bytes.fromhex("8b3387e9c5cdea6ac9e5edbaa115cd72")
 MESHCORE_ROUTE_TYPES = {0: "TRANS_FLOOD", 1: "FLOOD", 2: "DIRECT", 3: "TRANS_DIRECT"}
 MESHCORE_PAYLOAD_TYPES = {
     0: "REQ", 1: "RESP", 2: "TXT_MSG", 3: "ACK", 4: "ADVERT", 5: "GRP_TXT",
@@ -364,6 +370,7 @@ def meshcore_parse_packet(data: bytes) -> dict:
         off += path_bytes_len
         payload = data[off:]
         out["payload_len"] = len(payload)
+        out["payload_bytes"] = payload
 
         if payload_type == 0x04 and len(payload) >= 101:  # ADVERT
             pubkey = payload[0:32]
@@ -395,6 +402,60 @@ def meshcore_parse_packet(data: bytes) -> dict:
     except Exception as e:
         out["error"] = str(e)
         return out
+
+def meshcore_decrypt_group_text(payload: bytes, keys: list[bytes] | None = None) -> dict | None:
+    """Decrypt a MeshCore GRP_TXT payload: channel_hash(1) + MAC(2) + ciphertext.
+
+    MAC is the first 2 bytes of HMAC-SHA256(key zero-padded to 32B, ciphertext);
+    ciphertext is AES-128-ECB, plaintext = timestamp(4 LE) + flags(1) +
+    "Sender: message" (null-terminated). Returns None if no key verifies.
+    """
+    import hmac as _hmac
+    import hashlib as _hashlib
+    if len(payload) < 3 + 16:
+        return None
+    channel_hash = payload[0]
+    mac = payload[1:3]
+    ciphertext = payload[3:]
+    if len(ciphertext) % 16 != 0:
+        # AES-ECB with no padding: must be block-aligned
+        ciphertext = ciphertext[: len(ciphertext) - (len(ciphertext) % 16)]
+        if not ciphertext:
+            return None
+    candidates = list(keys or [])
+    if MESHCORE_PUBLIC_CHANNEL_KEY not in candidates:
+        candidates.insert(0, MESHCORE_PUBLIC_CHANNEL_KEY)
+    for key in candidates:
+        if len(key) != 16:
+            continue
+        secret = key + bytes(16)  # zero-pad to 32 bytes for the HMAC
+        calc = _hmac.new(secret, ciphertext, _hashlib.sha256).digest()[:2]
+        if calc != mac:
+            continue
+        try:
+            cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
+            dec = cipher.decryptor()
+            plain = dec.update(ciphertext) + dec.finalize()
+        except Exception:
+            continue
+        if len(plain) < 5:
+            continue
+        timestamp = int.from_bytes(plain[0:4], "little")
+        text = plain[5:].decode("utf-8", errors="replace").split("\0")[0]
+        sender, content = None, text
+        if ": " in text:
+            maybe_sender, rest = text.split(": ", 1)
+            if 0 < len(maybe_sender) < 50 and not any(c in maybe_sender for c in ":[]"):
+                sender, content = maybe_sender, rest
+        is_public = key == MESHCORE_PUBLIC_CHANNEL_KEY
+        return {
+            "channel_hash": channel_hash,
+            "channel": "Public" if is_public else key.hex()[:8],
+            "timestamp": timestamp,
+            "sender": sender,
+            "text": content,
+        }
+    return None
 
 def meshcore_packet_summary(mc: dict) -> str:
     if not mc.get("valid"):
@@ -2717,6 +2778,25 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                     adv = mc.get("advert")
                     if adv:
                         sender_label = "!" + adv["public_key"][:8]
+                        # Put advertised nodes on the map / node list
+                        try:
+                            node_kwargs = {
+                                "long_name": adv.get("name") or ("MeshCore " + adv["public_key"][:8]),
+                                "short_name": (adv.get("name") or adv["public_key"])[:4],
+                                "role": adv.get("role", "Unknown"),
+                                "hw_model": "MeshCore",
+                                "public_key": adv["public_key"],
+                                "snr": snr_val, "rssi": rssi_val,
+                                "hops": mc.get("hops"),
+                            }
+                            loc = adv.get("location")
+                            if loc:
+                                node_kwargs["lat"] = loc[0]
+                                node_kwargs["lon"] = loc[1]
+                                node_kwargs["location_source"] = "MeshCore advert"
+                            update_node(sender_label, **node_kwargs)
+                        except Exception as e:
+                            log_to_console(f"[MESHCORE] node update error: {e}")
                     try:
                         mesh_stats.on_packet_received(sender_label, mc.get("hops"), snr_val, rssi_val)
                     except Exception:
@@ -2724,7 +2804,24 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                     metrics = ""
                     if snr_val is not None:
                         metrics = f" | SNR {snr_val:.1f} RSSI {rssi_val:.0f}"
-                    log_to_console(f"[MESHCORE] {meshcore_packet_summary(mc)}{metrics}")
+                    summary = meshcore_packet_summary(mc)
+                    # GroupText: try the Public channel key plus any 16-byte
+                    # keys from the configured extra channels
+                    if mc.get("valid") and mc.get("payload_type") == "GRP_TXT":
+                        try:
+                            extra16 = [
+                                bytes(ent["key"]) for ent in _get_extra_channel_keys()
+                                if isinstance(ent.get("key"), (bytes, bytearray)) and len(ent["key"]) == 16
+                            ]
+                        except Exception:
+                            extra16 = []
+                        grp = meshcore_decrypt_group_text(mc.get("payload_bytes", b""), extra16)
+                        if grp:
+                            who = grp.get("sender") or "?"
+                            summary += f" | [{grp['channel']}] {who}: {grp['text']}"
+                        else:
+                            summary += " | (no matching channel key)"
+                    log_to_console(f"[MESHCORE] {summary}{metrics}")
                     continue
 
                 # 1) Extract Meshtastic fields
@@ -3368,14 +3465,14 @@ def start_engine_direct():
             f"BW {custom_calc['bw_khz']:.1f} kHz, SF{custom_calc['sf']}, CR4/{custom_calc['cr']}"
         )
     elif getattr(state, "direct_protocol", "MESHTASTIC") == "MESHCORE":
-        mc = MESHCORE_REGION_DEFAULTS.get(region)
-        if not mc:
+        chains = MESHCORE_REGION_DEFAULTS.get(region)
+        if not chains:
             msg = (f"No MeshCore defaults known for region {region}. "
-                   "Enable custom modem settings to set frequency/BW/SF manually.")
+                   "Use the custom modem settings to set frequency/BW/SF manually.")
             log_to_console(f"[ENGINE] {msg}")
             show_engine_error_dialog(msg)
             return
-        freq_mhz, bw_khz, sf, cr = mc
+        freq_mhz, bw_khz, sf, cr = chains[0]
         primary_calc = {
             "center_freq_hz": int(round(freq_mhz * 1_000_000)),
             "center_freq_mhz": freq_mhz,
@@ -3385,9 +3482,19 @@ def start_engine_direct():
             "channel_name": "",
         }
         primary_key, primary_preset_id = "MESHCORE", 0
-        valid_configs = []
+        # Extra demod chains catch nodes still on older/wider settings
+        valid_configs = [
+            {
+                "sf": c_sf,
+                "bw": int(round(c_bw * 1000)),
+                "center_freq": int(round(c_freq * 1_000_000)),
+                "preset_id": 0,
+            }
+            for (c_freq, c_bw, c_sf, c_cr) in chains[1:]
+        ]
         log_to_console(
-            f"[ENGINE] MeshCore ({region}): {freq_mhz:.3f} MHz, BW {bw_khz:.0f} kHz, SF{sf}, CR4/{cr}"
+            f"[ENGINE] MeshCore ({region}): {freq_mhz:.3f} MHz, BW {bw_khz:.1f} kHz, SF{sf}, CR4/{cr}"
+            + (f" (+{len(valid_configs)} legacy chain(s))" if valid_configs else "")
         )
     # --- Build preset configs (unified: single or ALL) ---
     else:
@@ -5627,16 +5734,40 @@ def main_page():
                                         "⚠ Enable only if you know what you are doing!\nThis powers the antenna port (Bias-T).\nConnecting unsupported hardware may damage your SDR or antenna."
                                     )
                                 ).classes('whitespace-pre-line')
-                            # Protocol select (Meshtastic / MeshCore first pass)
+                            # Protocol select (Meshtastic / MeshCore)
+                            def _apply_protocol_visibility():
+                                # Preset/slot/default-channel are Meshtastic
+                                # concepts; hide them in MeshCore mode
+                                is_mt = getattr(state, 'direct_protocol', 'MESHTASTIC') == 'MESHTASTIC'
+                                try:
+                                    preset_select.visible = is_mt
+                                    slot_select.visible = is_mt
+                                    channel_settings_expansion.visible = is_mt
+                                    meshcore_custom_checkbox.visible = not is_mt
+                                except Exception:
+                                    pass
+                            def _on_protocol_change(e):
+                                state.direct_protocol = str(e.value or 'MESHTASTIC')
+                                if state.direct_protocol == 'MESHCORE':
+                                    # Custom modem (e.g. MeshOregon) must not
+                                    # override the MeshCore defaults silently
+                                    state.direct_custom_enabled = False
+                                    try:
+                                        if preset_select.value == "CUSTOM":
+                                            preset_select.value = state.direct_preset if state.direct_preset in preset_options else "LONG_FAST"
+                                    except Exception:
+                                        pass
+                                save_user_config()
+                                _apply_protocol_visibility()
                             ui.select(
                                 options={
                                     "MESHTASTIC": "Meshtastic",
                                     "MESHCORE": translate(
                                         "panel.connection.settings.internal.option.meshcore",
-                                        "MeshCore (experimental: adverts decoded, console log only)"),
+                                        "MeshCore (experimental)"),
                                 },
                                 value=getattr(state, 'direct_protocol', 'MESHTASTIC'),
-                                on_change=lambda e: (setattr(state, 'direct_protocol', str(e.value or 'MESHTASTIC')), save_user_config()),
+                                on_change=_on_protocol_change,
                                 label=translate("panel.connection.settings.internal.label.protocol", "Protocol"),
                             ).props('dense options-dense').classes('w-full mb-0')
                             region_options = {k: f"{k} — {v['description']}" for k, v in MESHTASTIC_REGIONS.items() if k != "UNSET"}
@@ -5653,7 +5784,7 @@ def main_page():
                             preset_options["CUSTOM"] = translate(
                                 "panel.connection.settings.internal.option.custompreset",
                                 "CUSTOM — Custom modem settings below (e.g. MeshOregon)")
-                            ui.select(
+                            preset_select = ui.select(
                                 options=preset_options,
                                 value=("CUSTOM" if getattr(state, 'direct_custom_enabled', False)
                                        else state.direct_preset if state.direct_preset in preset_options else "LONG_FAST"),
@@ -5698,8 +5829,10 @@ def main_page():
                                         and not getattr(state, 'direct_custom_enabled', False)):
                                     mc = MESHCORE_REGION_DEFAULTS.get(state.direct_region)
                                     if mc:
+                                        f0, bw0, sf0, cr0 = mc[0]
+                                        extra = f" (+{len(mc) - 1} legacy chain)" if len(mc) > 1 else ""
                                         freq_info_label.text = (
-                                            f"→ MeshCore: {mc[0]:.3f} MHz | BW {mc[1]:.0f}kHz SF{mc[2]} CR4/{mc[3]}"
+                                            f"→ MeshCore: {f0:.3f} MHz | BW {bw0:.1f}kHz SF{sf0} CR4/{cr0}{extra}"
                                         )
                                         freq_info_label.classes(remove='text-red-500 text-gray-500', add='text-orange-500')
                                     else:
@@ -5778,6 +5911,14 @@ def main_page():
                                         except Exception:
                                             pass
                                     return _h
+                                # In MeshCore mode the Modem Preset dropdown is
+                                # hidden, so custom mode gets its own toggle
+                                meshcore_custom_checkbox = ui.checkbox(
+                                    translate("panel.connection.settings.internal.custom_modem.meshcore_override",
+                                              "Override MeshCore defaults with these values"),
+                                    value=getattr(state, 'direct_custom_enabled', False),
+                                    on_change=_set_custom('direct_custom_enabled', bool),
+                                ).props('dense')
                                 with ui.row().classes('w-full items-end gap-2 no-wrap'):
                                     ui.number(
                                         label=translate("panel.connection.settings.internal.custom_modem.freq", "Frequency (MHz)"),
@@ -5804,9 +5945,10 @@ def main_page():
                                         label=translate("panel.connection.settings.internal.custom_modem.cr", "Coding Rate"),
                                         on_change=_set_custom('direct_custom_cr', int),
                                     ).props('dense options-dense').classes('w-1/2')
-                            with ui.expansion(
+                            channel_settings_expansion = ui.expansion(
                                 translate("panel.connection.settings.internal.label.default_channel_settings", "Edit default channel settings")
-                            ).classes('w-full mb-0 text-xs'):
+                            ).classes('w-full mb-0 text-xs')
+                            with channel_settings_expansion:
                                 # Alert explaining default channel
                                 ui.label(
                                     translate(
@@ -5868,6 +6010,8 @@ def main_page():
                                     translate("button.connect", "Connect"),
                                     on_click=_on_connect_direct_click
                                 ).classes('bg-blue-600 text-white')
+                            # Initial visibility for the selected protocol
+                            _apply_protocol_visibility()
 
                         with ui.tab_panel(tab_ext):
                             ui.label(translate("panel.connection.settings.external.title", "External GNU Radio / ZMQ stream")).classes('font-bold mb-1')

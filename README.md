@@ -275,10 +275,13 @@ standard Meshtastic preset. Example — [MeshOregon](https://meshoregon.com):
 918.5 MHz, BW 125, SF 8, CR 4/5, primary channel `MeshOregon` with PSK
 `AQ==` (set the channel name in the default channel settings).
 
-### MeshCore (experimental first pass)
+### MeshCore (experimental)
 
 Protocol selector supports [MeshCore](https://meshcore.co.uk): tunes to the
-community defaults (US 910.525 MHz BW250 SF10, EU 869.525 MHz BW250 SF11 —
-other regions via custom modem settings) and decodes packet headers, routing
-path, and full adverts (node name, role, location, public key) to the console
-log and RX stats. Map integration and encrypted payloads are not yet handled.
+current community defaults (US 910.525 MHz BW62.5 SF7 CR5; EU 869.525 MHz —
+the post-Oct-2025 "narrow" settings, with the older wide settings decoded in
+parallel as legacy chains; other regions via the custom-override toggle).
+Decodes packet headers, routing paths, and full adverts — advertised nodes
+appear on the map and node list with name, role, and location. Public-channel
+group texts are decrypted (well-known key, hash 0x11), plus any 16-byte keys
+from your extra channels; other payload types are identified and logged.

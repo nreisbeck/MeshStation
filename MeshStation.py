@@ -451,11 +451,83 @@ def meshcore_decrypt_group_text(payload: bytes, keys: list[bytes] | None = None)
         return {
             "channel_hash": channel_hash,
             "channel": "Public" if is_public else key.hex()[:8],
+            "key": key,
             "timestamp": timestamp,
             "sender": sender,
             "text": content,
         }
     return None
+
+def meshcore_normalize_channel_key(text: str) -> bytes | None:
+    """Parse a MeshCore channel secret as entered by a user.
+
+    MeshCore clients show it as "Secret Key (hex)" (32 hex chars = 128 bit);
+    some devices (T-Deck) display the same key as base64. Accept both.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    if re.fullmatch(r"[0-9a-fA-F]{32}", t):
+        return bytes.fromhex(t)
+    try:
+        raw = base64.b64decode(t, validate=True)
+        if len(raw) == 16:
+            return raw
+    except Exception:
+        pass
+    return None
+
+_meshcore_seen_msgs = deque(maxlen=256)
+
+def meshcore_route_group_text(grp: dict) -> bool:
+    """Route a decrypted MeshCore group text into the chat UI.
+
+    Messages whose key matches a configured extra channel go to that
+    channel's tab; Public (or unmatched) goes to the default tab. Flood
+    rebroadcasts of the same message are dropped. Returns False for dupes.
+    """
+    sig = (grp.get("channel_hash"), grp.get("timestamp"), grp.get("sender"), grp.get("text"))
+    if sig in _meshcore_seen_msgs:
+        return False
+    _meshcore_seen_msgs.append(sig)
+    now_dt = datetime.now()
+    msg_obj = {
+        "time": now_dt.strftime("%H:%M"),
+        "date": now_dt.strftime("%d/%m/%Y"),
+        "from": grp.get("sender") or "Unknown",
+        "from_id": "",
+        "to": "^all",
+        "text": grp.get("text", ""),
+        "is_me": False,
+        "preset": None,
+    }
+    key = grp.get("key")
+    ch_id = None
+    if key:
+        for ch in getattr(state, "extra_channels", []) or []:
+            try:
+                if base64.b64decode(ch.get("key_b64") or "") == key:
+                    ch_id = str(ch.get("id") or "") or None
+                    break
+            except Exception:
+                continue
+    try:
+        if ch_id:
+            if ch_id not in state.channel_messages:
+                state.channel_messages[ch_id] = deque(maxlen=100)
+            state.channel_messages[ch_id].append(msg_obj)
+            if state.active_channel_id != ch_id:
+                state.channel_unread[ch_id] = True
+                state.channel_unread_count[ch_id] = int(state.channel_unread_count.get(ch_id, 0)) + 1
+        else:
+            state.messages.append(msg_obj)
+            state.new_messages.append(msg_obj)
+            if state.active_channel_id != 'default':
+                state.channel_unread['default'] = True
+                state.channel_unread_count['default'] = int(state.channel_unread_count.get('default', 0)) + 1
+    except Exception:
+        pass
+    return True
 
 def meshcore_packet_summary(mc: dict) -> str:
     if not mc.get("valid"):
@@ -2780,11 +2852,11 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                         sender_label = "!" + adv["public_key"][:8]
                         # Put advertised nodes on the map / node list
                         try:
+                            # No hw_model: MeshCore adverts don't carry one
                             node_kwargs = {
                                 "long_name": adv.get("name") or ("MeshCore " + adv["public_key"][:8]),
                                 "short_name": (adv.get("name") or adv["public_key"])[:4],
                                 "role": adv.get("role", "Unknown"),
-                                "hw_model": "MeshCore",
                                 "public_key": adv["public_key"],
                                 "snr": snr_val, "rssi": rssi_val,
                                 "hops": mc.get("hops"),
@@ -2819,6 +2891,8 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                         if grp:
                             who = grp.get("sender") or "?"
                             summary += f" | [{grp['channel']}] {who}: {grp['text']}"
+                            if not meshcore_route_group_text(grp):
+                                summary += " (duplicate, not re-shown in chat)"
                         else:
                             summary += " | (no matching channel key)"
                     log_to_console(f"[MESHCORE] {summary}{metrics}")
@@ -8331,28 +8405,48 @@ def main_page():
                                     existing = ch
                                     break
                         
+                        is_meshcore = getattr(state, 'direct_protocol', 'MESHTASTIC') == 'MESHCORE'
                         with ui.dialog() as dlg, ui.card().classes('w-96'):
                             title = translate('channel.edit.title', 'Edit Channel') if existing else translate('channel.add.title', 'Add Channel')
                             ui.label(title).classes('text-lg font-bold mb-2')
-                            
+
                             name_input = ui.input(
                                 translate('channel.add.name', 'Channel Name'),
                                 value=existing.get('name', '') if existing else ''
                             ).classes('w-full mb-1')
-                            ui.label(translate('channel.add.name.hint', 'Used to match incoming packets (djb2 hash of name)')).classes('text-xs text-gray-400 mb-2')
-                            
+                            if is_meshcore:
+                                ui.label(translate('channel.add.name.hint.meshcore',
+                                    'Display name only — MeshCore channels are identified by their secret key, not the name.')).classes('text-xs text-gray-400 mb-2')
+                            else:
+                                ui.label(translate('channel.add.name.hint', 'Used to match incoming packets (djb2 hash of name)')).classes('text-xs text-gray-400 mb-2')
+
                             label_input = ui.input(
                                 translate('channel.add.label', 'Display Label (optional, defaults to name)'),
                                 value=existing.get('label', '') if existing else ''
                             ).classes('w-full mb-1')
-                            
-                            key_input = ui.input(
-                                translate('channel.add.key', 'AES Key (Base64)'),
-                                value=existing.get('key_b64', 'AQ==') if existing else 'AQ=='
-                            ).classes('w-full mb-1')
-                            ui.label(translate('panel.connection.settings.internal.label.aes_key.hint',
-                                "Key size is auto-detected. 'AQ==' = Meshtastic default.")).classes('text-xs text-gray-400 mb-2')
-                            
+
+                            if is_meshcore:
+                                _existing_key = ''
+                                if existing:
+                                    try:
+                                        _existing_key = base64.b64decode(existing.get('key_b64') or '').hex()
+                                    except Exception:
+                                        _existing_key = existing.get('key_b64', '')
+                                key_input = ui.input(
+                                    translate('channel.add.key.meshcore', 'Secret Key (hex)'),
+                                    value=_existing_key
+                                ).classes('w-full mb-1')
+                                ui.label(translate('channel.add.key.meshcore.hint',
+                                    "As shown in MeshCore clients (32 hex characters); base64 (T-Deck style) also accepted. "
+                                    "Public channel: 8b3387e9c5cdea6ac9e5edbaa115cd72 — already monitored by default.")).classes('text-xs text-gray-400 mb-2')
+                            else:
+                                key_input = ui.input(
+                                    translate('channel.add.key', 'AES Key (Base64)'),
+                                    value=existing.get('key_b64', 'AQ==') if existing else 'AQ=='
+                                ).classes('w-full mb-1')
+                                ui.label(translate('panel.connection.settings.internal.label.aes_key.hint',
+                                    "Key size is auto-detected. 'AQ==' = Meshtastic default.")).classes('text-xs text-gray-400 mb-2')
+
                             def save_channel():
                                 import secrets as _sec
                                 name = name_input.value.strip()
@@ -8360,8 +8454,16 @@ def main_page():
                                     ui.notify(translate('channel.add.error.noname', 'Channel name is required'), color='negative')
                                     return
                                 lbl = label_input.value.strip() or name
-                                key = key_input.value.strip() or 'AQ=='
-                                
+                                if is_meshcore:
+                                    key_bytes = meshcore_normalize_channel_key(key_input.value)
+                                    if key_bytes is None:
+                                        ui.notify(translate('channel.add.error.badkey.meshcore',
+                                            'Invalid MeshCore key: expected 32 hex characters (or base64 of 16 bytes)'), color='negative')
+                                        return
+                                    key = base64.b64encode(key_bytes).decode()
+                                else:
+                                    key = key_input.value.strip() or 'AQ=='
+
                                 if existing:
                                     existing['name'] = name
                                     existing['label'] = lbl

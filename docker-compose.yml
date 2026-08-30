@@ -1,0 +1,24 @@
+services:
+  meshstation:
+    build: .
+    image: meshstation:latest
+    container_name: meshstation
+    ports:
+      - "8080:8080"
+    volumes:
+      - meshstation-data:/app/data
+    environment:
+      # SDR used when none is selected in the GUI. Any osmosdr device args
+      # work; a networked dongle needs no USB passthrough:
+      MESHSTATION_DEVICE_ARGS: "rtl_tcp=pi-sdr.local:1234"
+      # Defaults for a fresh install (GUI settings override once saved)
+      MESHSTATION_DEFAULT_REGION: "US"
+      MESHSTATION_DEFAULT_PRESET: "LONG_FAST"
+    # Containers can't resolve mDNS .local names — pin the host here if your
+    # SDR server uses one (or use its IP in MESHSTATION_DEVICE_ARGS)
+    extra_hosts:
+      - "pi-sdr.local:192.168.100.141"
+    restart: unless-stopped
+
+volumes:
+  meshstation-data:

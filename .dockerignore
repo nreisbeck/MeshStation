@@ -1,0 +1,6 @@
+.git
+.github
+engine/os
+offlinemaps/*.mbtiles
+data
+*.tar.gz

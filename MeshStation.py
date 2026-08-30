@@ -931,13 +931,15 @@ class AppState:
         self.autosave_interval_sec = 30
         self.autosave_last_ts = 0.0
 
-        self.direct_region = "EU_868"
-        self.direct_preset = "MEDIUM_FAST"
+        # Env overrides let headless/Docker deployments pick sane defaults;
+        # values saved from the GUI (config file) still take precedence.
+        self.direct_region = os.environ.get('MESHSTATION_DEFAULT_REGION', "EU_868")
+        self.direct_preset = os.environ.get('MESHSTATION_DEFAULT_PRESET', "MEDIUM_FAST")
         self.direct_frequency_slot = 0        # 0 = auto (hash-based), 1..N = manual
         self.direct_channel_name = ""         # "" = use default name of the preset
         self.direct_ppm = 0
         self.direct_gain = 30
-        self.direct_device_args = "rtl=0"
+        self.direct_device_args = os.environ.get('MESHSTATION_DEVICE_ARGS', "rtl=0")
         self.direct_device_detected_args = []
         self.direct_bias_tee = False
         self.direct_port = "20002"
@@ -3119,12 +3121,22 @@ def start_engine_direct():
     ch_name = getattr(state, "direct_channel_name", "") or None
 
     raw_device_args = str(getattr(state, "direct_device_args", "") or "").strip()
+    if not raw_device_args:
+        # Headless/Docker: no device configured means "use the deployment's
+        # SDR", typically a networked one (e.g. rtl_tcp=host:1234)
+        raw_device_args = os.environ.get('MESHSTATION_DEVICE_ARGS', '').strip()
+        if raw_device_args:
+            log_to_console(f"[ENGINE] Using device args from MESHSTATION_DEVICE_ARGS: {raw_device_args}")
     device_args = raw_device_args
     if raw_device_args and not re.search(r"\b(rtl|hackrf|bladerf|uhd|soapy|airspy|plutosdr|lime)=", raw_device_args, flags=re.IGNORECASE):
         log_to_console(f"[ENGINE] Passing through unrecognized device args: {raw_device_args}")
     try:
+        # Only auto-reset local `driver=<index>` selections that the USB scan
+        # can actually verify. Networked SDRs (rtl_tcp=host:port, SoapySDR
+        # remotes, ...) never appear in the scan — pass them through.
+        is_local_indexed = bool(re.fullmatch(r"[a-zA-Z_]+=\d+", device_args))
         avail = getattr(state, "direct_device_detected_args", None)
-        if device_args and isinstance(avail, list) and avail and device_args not in avail:
+        if device_args and is_local_indexed and isinstance(avail, list) and avail and device_args not in avail:
             log_to_console(f"[ENGINE] Selected device not available: {device_args}; falling back to auto")
             device_args = ""
             state.direct_device_args = ""
@@ -5325,6 +5337,10 @@ def main_page():
                                         value=_saved_device_args if _saved_device_args in _direct_device_options else "",
                                         on_change=on_direct_device_change,
                                         label=translate("panel.connection.settings.internal.label.device", "SDR Device"),
+                                        # Allow typing custom osmosdr device args for SDRs the
+                                        # local USB scan can't see (e.g. rtl_tcp=host:1234,
+                                        # soapy=0,driver=remote)
+                                        new_value_mode='add-unique',
                                     ).props('dense').classes('w-full device-select')
                                     direct_device_tooltip = ui.tooltip("")
                                     _update_device_tooltip()
@@ -8331,17 +8347,38 @@ if __name__ in {"__main__", "__mp_main__"}:
         print("DEBUG: MAIN STARTED", flush=True)
     
     try:
-        if not check_native_runtime_deps():
+        # MESHSTATION_WEB: headless mode (Docker/servers) — serve the nicegui
+        # UI to a plain browser; no native window, splash, or desktop deps.
+        web_mode = bool(os.environ.get('MESHSTATION_WEB'))
+
+        if not web_mode and not check_native_runtime_deps():
             sys.exit(1)
-        
+
         if multiprocessing.current_process().name == 'MainProcess':
             if _NOGPU_REQUESTED:
                 print(f"[{PROGRAM_NAME}] Software rendering mode active (--nogpu). GPU/hardware acceleration is disabled.", flush=True)
             print(f"{PROGRAM_NAME} started.", flush=True)
-            start_tk_splash()
-            
+            if not web_mode:
+                start_tk_splash()
+
         ensure_app_icon_file()
         system = platform.system()
+
+        if web_mode:
+            try:
+                signal.signal(signal.SIGTERM, lambda s, f: _shutdown_cleanup())
+            except Exception:
+                pass
+            ui.run(
+                title=f'{PROGRAM_NAME} v{VERSION} By {AUTHOR}',
+                favicon=get_resource_path('app_icon.svg'),
+                host=os.environ.get('MESHSTATION_HOST', '0.0.0.0'),
+                port=int(os.environ.get('MESHSTATION_PORT', '8080')),
+                reload=False,
+                show=False,
+                show_welcome_message=ncgwmex
+            )
+            sys.exit(0)
 
         if system == "Darwin":
             try:

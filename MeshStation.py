@@ -8425,9 +8425,10 @@ def main_page():
                             ).classes('w-full mb-1')
                             if is_meshcore:
                                 ui.label(translate('channel.add.name.hint.meshcore',
-                                    'Hashtag channels: name the channel e.g. "#hiking" and leave the key blank — '
-                                    'the key derives from the name (SHA256). Otherwise the name is a display label '
-                                    'only; the secret key identifies the channel.')).classes('text-xs text-gray-400 mb-2')
+                                    'Name "Public" with a blank key = the well-known Public channel. '
+                                    'Hashtag channels: name it e.g. "#hiking" with a blank key — the key derives '
+                                    'from the name (SHA256). Otherwise the name is a display label only; the '
+                                    'secret key identifies the channel.')).classes('text-xs text-gray-400 mb-2')
                             else:
                                 ui.label(translate('channel.add.name.hint', 'Used to match incoming packets (djb2 hash of name)')).classes('text-xs text-gray-400 mb-2')
 
@@ -8468,7 +8469,10 @@ def main_page():
                                 lbl = label_input.value.strip() or name
                                 if is_meshcore:
                                     kv = (key_input.value or '').strip()
-                                    if not kv and name.startswith('#'):
+                                    if not kv and name.lstrip('#').strip().lower() == 'public':
+                                        # Well-known Public channel key
+                                        key_bytes = MESHCORE_PUBLIC_CHANNEL_KEY
+                                    elif not kv and name.startswith('#'):
                                         # Hashtag channel: key derives from the name
                                         key_bytes = meshcore_derive_hashtag_key(name)
                                     else:

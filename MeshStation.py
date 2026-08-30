@@ -939,6 +939,13 @@ class AppState:
         self.direct_channel_name = ""         # "" = use default name of the preset
         self.direct_ppm = 0
         self.direct_gain = 30
+        # Custom modem settings: override region/preset radio parameters
+        # entirely (e.g. MeshOregon: 918.5 MHz, BW 125, SF 8, CR 5)
+        self.direct_custom_enabled = False
+        self.direct_custom_freq_mhz = 918.5
+        self.direct_custom_bw_khz = 125.0
+        self.direct_custom_sf = 8
+        self.direct_custom_cr = 5
         self.direct_device_args = os.environ.get('MESHSTATION_DEVICE_ARGS', "rtl=0")
         self.direct_device_detected_args = []
         self.direct_bias_tee = False
@@ -1700,6 +1707,41 @@ def load_user_config():
         else:
             # Unknown but non-empty: store as-is, engine will validate
             s.direct_device_args = tv
+    v = data.get("direct_custom_enabled")
+    if isinstance(v, bool):
+        s.direct_custom_enabled = v
+    v = data.get("direct_custom_freq_mhz")
+    if v is not None:
+        try:
+            fv = float(v)
+            if 100.0 <= fv <= 6000.0:
+                s.direct_custom_freq_mhz = fv
+        except Exception:
+            pass
+    v = data.get("direct_custom_bw_khz")
+    if v is not None:
+        try:
+            bv = float(v)
+            if bv in (62.5, 125.0, 250.0, 500.0, 812.5):
+                s.direct_custom_bw_khz = bv
+        except Exception:
+            pass
+    v = data.get("direct_custom_sf")
+    if v is not None:
+        try:
+            sv = int(v)
+            if 5 <= sv <= 12:
+                s.direct_custom_sf = sv
+        except Exception:
+            pass
+    v = data.get("direct_custom_cr")
+    if v is not None:
+        try:
+            cv = int(v)
+            if 5 <= cv <= 8:
+                s.direct_custom_cr = cv
+        except Exception:
+            pass
     v = data.get("direct_bias_tee")
     if isinstance(v, bool):
         s.direct_bias_tee = v
@@ -1776,6 +1818,11 @@ def save_user_config():
             "direct_ppm": state.direct_ppm,
             "direct_gain": state.direct_gain,
             "direct_device_args": getattr(state, "direct_device_args", "rtl=0"),
+            "direct_custom_enabled": getattr(state, "direct_custom_enabled", False),
+            "direct_custom_freq_mhz": getattr(state, "direct_custom_freq_mhz", 918.5),
+            "direct_custom_bw_khz": getattr(state, "direct_custom_bw_khz", 125.0),
+            "direct_custom_sf": getattr(state, "direct_custom_sf", 8),
+            "direct_custom_cr": getattr(state, "direct_custom_cr", 5),
             "direct_bias_tee": getattr(state, "direct_bias_tee", False),
             "direct_port": state.direct_port,
             "direct_key_b64": state.direct_key_b64,
@@ -3144,39 +3191,58 @@ def start_engine_direct():
     except Exception:
         pass
 
-    # --- Build preset configs (unified: single or ALL) ---
-    if preset_name == "ALL":
-        all_presets = list(MESHTASTIC_MODEM_PRESETS.keys())
-    else:
-        all_presets = [preset_name]
-
-    valid_configs = []
-    primary = None
-    for pk in all_presets:
-        pid = PRESET_ID_REVERSE.get(pk, 0)
-        calc = meshtastic_calc_freq(region, pk, freq_slot, ch_name)
-        if not calc.get("valid"):
-            log_to_console(f"[ENGINE] Skipping {pk}: {calc.get('error')}")
-            continue
-        entry = {
-            "sf": calc["sf"],
-            "bw": int(round(calc["bw_khz"] * 1000)),
-            "center_freq": calc["center_freq_hz"],
-            "preset_id": pid,
+    # --- Custom modem settings: explicit freq/BW/SF override (e.g. regional
+    # meshes like MeshOregon that don't use a standard preset) ---
+    if getattr(state, "direct_custom_enabled", False):
+        custom_calc = {
+            "center_freq_hz": int(round(float(state.direct_custom_freq_mhz) * 1_000_000)),
+            "center_freq_mhz": float(state.direct_custom_freq_mhz),
+            "bw_khz": float(state.direct_custom_bw_khz),
+            "sf": int(state.direct_custom_sf),
+            "cr": int(state.direct_custom_cr),
+            "channel_name": ch_name or "",
         }
-        if primary is None:
-            primary = (pk, pid, calc, entry)
+        primary = ("CUSTOM", 0, custom_calc, None)
+        primary_key, primary_preset_id, primary_calc, _ = primary
+        valid_configs = []
+        log_to_console(
+            f"[ENGINE] Custom modem: {custom_calc['center_freq_mhz']:.3f} MHz, "
+            f"BW {custom_calc['bw_khz']:.1f} kHz, SF{custom_calc['sf']}, CR4/{custom_calc['cr']}"
+        )
+    # --- Build preset configs (unified: single or ALL) ---
+    else:
+        if preset_name == "ALL":
+            all_presets = list(MESHTASTIC_MODEM_PRESETS.keys())
         else:
-            valid_configs.append(entry)
+            all_presets = [preset_name]
 
-    if primary is None:
-        msg = f"No valid preset found for region {region}."
-        log_to_console(f"[ENGINE] {msg}")
-        show_engine_error_dialog(msg)
-        return
+        valid_configs = []
+        primary = None
+        for pk in all_presets:
+            pid = PRESET_ID_REVERSE.get(pk, 0)
+            calc = meshtastic_calc_freq(region, pk, freq_slot, ch_name)
+            if not calc.get("valid"):
+                log_to_console(f"[ENGINE] Skipping {pk}: {calc.get('error')}")
+                continue
+            entry = {
+                "sf": calc["sf"],
+                "bw": int(round(calc["bw_khz"] * 1000)),
+                "center_freq": calc["center_freq_hz"],
+                "preset_id": pid,
+            }
+            if primary is None:
+                primary = (pk, pid, calc, entry)
+            else:
+                valid_configs.append(entry)
 
-    primary_key, primary_preset_id, primary_calc, _ = primary
-    log_to_console(f"[ENGINE] Primary: {primary_key} (preset_id={primary_preset_id}), extra chains: {len(valid_configs)}")
+        if primary is None:
+            msg = f"No valid preset found for region {region}."
+            log_to_console(f"[ENGINE] {msg}")
+            show_engine_error_dialog(msg)
+            return
+
+        primary_key, primary_preset_id, primary_calc, _ = primary
+        log_to_console(f"[ENGINE] Primary: {primary_key} (preset_id={primary_preset_id}), extra chains: {len(valid_configs)}")
 
     cmd = [
         py, "-m", "meshtastic_engine.run_engine",
@@ -5413,6 +5479,17 @@ def main_page():
                                 freq_info_label = ui.label("").classes('text-xs text-gray-500')
                                 freq_info_warning = ui.label("").classes('text-xs text-orange-500 hidden')
                             def _update_freq_info():
+                                if getattr(state, 'direct_custom_enabled', False):
+                                    freq_info_label.text = (
+                                        f"→ CUSTOM: {float(state.direct_custom_freq_mhz):.3f} MHz | "
+                                        f"BW {float(state.direct_custom_bw_khz):.1f}kHz "
+                                        f"SF{int(state.direct_custom_sf)} CR4/{int(state.direct_custom_cr)} | "
+                                        f"CH: \"{getattr(state, 'direct_channel_name', '') or 'default'}\""
+                                    )
+                                    freq_info_label.classes(remove='text-red-500 text-gray-500', add='text-orange-500')
+                                    freq_info_warning.text = ""
+                                    freq_info_warning.classes(add='hidden')
+                                    return
                                 r = state.direct_region
                                 p = state.direct_preset
                                 slot = getattr(state, 'direct_frequency_slot', 0)
@@ -5446,6 +5523,58 @@ def main_page():
                                     freq_info_warning.classes(add='hidden')
                             # Update info when relevant parameters change
                             ui.timer(0.5, _update_freq_info)
+                            # Custom modem settings: full override of the radio
+                            # parameters, for meshes that don't use a standard
+                            # preset (e.g. MeshOregon: 918.5 MHz, BW 125, SF 8)
+                            with ui.expansion(
+                                translate("panel.connection.settings.internal.label.custom_modem", "Custom modem settings (advanced)")
+                            ).classes('w-full mb-0 text-xs'):
+                                ui.label(
+                                    translate(
+                                        "panel.connection.settings.internal.custom_modem.help",
+                                        "When enabled, these values replace Region/Preset/Slot entirely. "
+                                        "Set the channel name and key in the channel settings to match the mesh."
+                                    )
+                                ).classes('text-xs text-gray-500')
+                                def _set_custom(field, cast):
+                                    def _h(e):
+                                        try:
+                                            setattr(state, field, cast(e.value))
+                                            save_user_config()
+                                        except Exception:
+                                            pass
+                                    return _h
+                                ui.checkbox(
+                                    translate("panel.connection.settings.internal.custom_modem.enable", "Use custom modem settings"),
+                                    value=getattr(state, 'direct_custom_enabled', False),
+                                    on_change=_set_custom('direct_custom_enabled', bool),
+                                ).props('dense')
+                                with ui.row().classes('w-full items-end gap-2 no-wrap'):
+                                    ui.number(
+                                        label=translate("panel.connection.settings.internal.custom_modem.freq", "Frequency (MHz)"),
+                                        value=float(getattr(state, 'direct_custom_freq_mhz', 918.5)),
+                                        min=100.0, max=6000.0, step=0.001, format='%.3f',
+                                        on_change=_set_custom('direct_custom_freq_mhz', float),
+                                    ).props('dense').classes('w-1/2')
+                                    ui.select(
+                                        options={62.5: "62.5 kHz", 125.0: "125 kHz", 250.0: "250 kHz", 500.0: "500 kHz", 812.5: "812.5 kHz"},
+                                        value=float(getattr(state, 'direct_custom_bw_khz', 125.0)),
+                                        label=translate("panel.connection.settings.internal.custom_modem.bw", "Bandwidth"),
+                                        on_change=_set_custom('direct_custom_bw_khz', float),
+                                    ).props('dense options-dense').classes('w-1/2')
+                                with ui.row().classes('w-full items-end gap-2 no-wrap'):
+                                    ui.select(
+                                        options={n: f"SF{n}" for n in range(5, 13)},
+                                        value=int(getattr(state, 'direct_custom_sf', 8)),
+                                        label=translate("panel.connection.settings.internal.custom_modem.sf", "Spreading Factor"),
+                                        on_change=_set_custom('direct_custom_sf', int),
+                                    ).props('dense options-dense').classes('w-1/2')
+                                    ui.select(
+                                        options={n: f"4/{n}" for n in range(5, 9)},
+                                        value=int(getattr(state, 'direct_custom_cr', 5)),
+                                        label=translate("panel.connection.settings.internal.custom_modem.cr", "Coding Rate"),
+                                        on_change=_set_custom('direct_custom_cr', int),
+                                    ).props('dense options-dense').classes('w-1/2')
                             with ui.expansion(
                                 translate("panel.connection.settings.internal.label.default_channel_settings", "Edit default channel settings")
                             ).classes('w-full mb-0 text-xs'):

@@ -5572,7 +5572,14 @@ def main_page():
                                     update_config_field('direct_region')(e)
                                     _refresh_slot_select()
                                 def _on_preset_change(e):
-                                    update_config_field('direct_preset')(e)
+                                    if str(e.value) == "CUSTOM":
+                                        # CUSTOM preset = the custom modem settings below
+                                        state.direct_custom_enabled = True
+                                        save_user_config()
+                                    else:
+                                        if getattr(state, 'direct_custom_enabled', False):
+                                            state.direct_custom_enabled = False
+                                        update_config_field('direct_preset')(e)
                                     _refresh_slot_select()
 
                                 with ui.element('div').style('flex: 1 1 0; min-width: 0; max-width: calc(100% - 90px); overflow: hidden;'):
@@ -5629,9 +5636,13 @@ def main_page():
                             # Preset select
                             preset_options = {k: f"{k} — {v['description']}" for k, v in MESHTASTIC_MODEM_PRESETS.items()}
                             preset_options["ALL"] = translate("panel.connection.settings.internal.option.allpresets", "ALL — Scan all presets simultaneously (Intensive)")
+                            preset_options["CUSTOM"] = translate(
+                                "panel.connection.settings.internal.option.custompreset",
+                                "CUSTOM — Custom modem settings below (e.g. MeshOregon)")
                             ui.select(
                                 options=preset_options,
-                                value=state.direct_preset if state.direct_preset in preset_options else "LONG_FAST",
+                                value=("CUSTOM" if getattr(state, 'direct_custom_enabled', False)
+                                       else state.direct_preset if state.direct_preset in preset_options else "LONG_FAST"),
                                 on_change=_on_preset_change,
                                 label=translate("panel.connection.settings.internal.label.modempreset", "Modem Preset")
                             ).props('dense options-dense').classes('w-full mb-0')
@@ -5739,8 +5750,10 @@ def main_page():
                                 ui.label(
                                     translate(
                                         "panel.connection.settings.internal.custom_modem.help",
-                                        "When enabled, these values replace Region/Preset/Slot entirely. "
-                                        "Set the channel name and key in the channel settings to match the mesh."
+                                        "Active when Modem Preset is set to CUSTOM: these values replace "
+                                        "Region/Preset/Slot entirely. Set the channel name and key in the "
+                                        "channel settings to match the mesh (MeshOregon: 918.5 MHz, BW 125, "
+                                        "SF 8, CR 4/5, channel \"MeshOregon\", PSK AQ==)."
                                     )
                                 ).classes('text-xs text-gray-500')
                                 def _set_custom(field, cast):
@@ -5751,11 +5764,6 @@ def main_page():
                                         except Exception:
                                             pass
                                     return _h
-                                ui.checkbox(
-                                    translate("panel.connection.settings.internal.custom_modem.enable", "Use custom modem settings"),
-                                    value=getattr(state, 'direct_custom_enabled', False),
-                                    on_change=_set_custom('direct_custom_enabled', bool),
-                                ).props('dense')
                                 with ui.row().classes('w-full items-end gap-2 no-wrap'):
                                     ui.number(
                                         label=translate("panel.connection.settings.internal.custom_modem.freq", "Frequency (MHz)"),

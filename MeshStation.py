@@ -486,6 +486,30 @@ def meshcore_derive_hashtag_key(room_name: str) -> bytes:
         name = "#" + name
     return _hashlib.sha256(name.encode("utf-8")).digest()[:16]
 
+def ensure_meshcore_public_channel():
+    """Make sure a channel with the well-known Public key exists, so Public
+    traffic always has a visible tab in MeshCore mode (where the Meshtastic
+    'Default' tab is hidden)."""
+    try:
+        for ch in getattr(state, 'extra_channels', []) or []:
+            try:
+                if base64.b64decode(ch.get('key_b64') or '') == MESHCORE_PUBLIC_CHANNEL_KEY:
+                    return
+            except Exception:
+                continue
+        import secrets as _sec
+        new_id = _sec.token_urlsafe(8)
+        state.extra_channels.append({
+            'id': new_id, 'name': 'Public', 'label': 'Public',
+            'key_b64': base64.b64encode(MESHCORE_PUBLIC_CHANNEL_KEY).decode(),
+        })
+        if new_id not in state.channels_order:
+            state.channels_order.append(new_id)
+        save_user_config()
+        log_to_console("[MESHCORE] Added the well-known Public channel")
+    except Exception:
+        pass
+
 _meshcore_seen_msgs = deque(maxlen=256)
 
 def meshcore_route_group_text(grp: dict) -> bool:
@@ -2083,6 +2107,9 @@ def load_user_config():
     v = data.get("channels_order")
     if isinstance(v, list):
         s.channels_order = [x for x in v if isinstance(x, str)]
+
+    if getattr(s, 'direct_protocol', 'MESHTASTIC') == 'MESHCORE':
+        ensure_meshcore_public_channel()
 
 def save_user_config():
     try:
@@ -5832,6 +5859,7 @@ def main_page():
                             def _on_protocol_change(e):
                                 state.direct_protocol = str(e.value or 'MESHTASTIC')
                                 if state.direct_protocol == 'MESHCORE':
+                                    ensure_meshcore_public_channel()
                                     # Custom modem (e.g. MeshOregon) must not
                                     # override the MeshCore defaults silently
                                     state.direct_custom_enabled = False
@@ -8291,10 +8319,12 @@ def main_page():
                             ui.notify(translate("notification.positive.filterednodesby", "Filtered nodes by: {s_id}").format(s_id=s_id))
                     # Extra channels functions
                     def _get_all_channel_ids():
-                        ids = ['default'] + [ch['id'] for ch in state.extra_channels 
-                                            if ch['id'] in [x for x in state.channels_order] or True]
-                        # order ids respecting channels_order
-                        ordered = ['default']
+                        # The "Default" tab is the Meshtastic primary channel
+                        # (name+PSK from the connection settings). MeshCore has
+                        # no such concept — channels are keys — so hide it there
+                        # (Public is auto-provisioned as a regular channel).
+                        is_meshcore = getattr(state, 'direct_protocol', 'MESHTASTIC') == 'MESHCORE'
+                        ordered = [] if is_meshcore else ['default']
                         for cid in state.channels_order:
                             if any(ch['id'] == cid for ch in state.extra_channels):
                                 ordered.append(cid)
@@ -8302,6 +8332,10 @@ def main_page():
                         for ch in state.extra_channels:
                             if ch['id'] not in ordered:
                                 ordered.append(ch['id'])
+                        if not ordered:
+                            ordered = ['default']
+                        if is_meshcore and state.active_channel_id == 'default' and ordered[0] != 'default':
+                            state.active_channel_id = ordered[0]
                         return ordered
 
                     def _get_channel_label(ch_id):

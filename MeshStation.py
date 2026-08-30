@@ -5532,9 +5532,17 @@ def main_page():
                             ui.label(translate("panel.connection.settings.internal.title", "Internal SDR Engine")).classes('font-bold mb-0')
                             ui.markdown(translate("panel.connection.settings.internal.help", 'The app manages the internal SDR engine for you.<br> Just select Region, Channel, PPM for your device and a suitable RF Gain.')).classes('text-sm text-gray-600')
                             _saved_device_args = str(getattr(state, "direct_device_args", "rtl=0") or "").strip()
+                            _env_device_args = os.environ.get('MESHSTATION_DEVICE_ARGS', '').strip()
                             _direct_device_options = {
                                 "": translate("panel.connection.settings.internal.device.auto", "Auto (first detected)"),
                             }
+                            if _env_device_args:
+                                _direct_device_options[""] = translate(
+                                    "panel.connection.settings.internal.device.auto_env",
+                                    "Auto — deployment SDR ({args})",
+                                ).format(args=_env_device_args)
+                                _direct_device_options[_env_device_args] = f"{_env_device_args} " + translate(
+                                    "panel.connection.settings.internal.device.env_tag", "(deployment SDR)")
                             if _saved_device_args and _saved_device_args not in _direct_device_options:
                                 m_driver = re.match(r"^([a-zA-Z_]+)=(\d+)", _saved_device_args)
                                 if m_driver:
@@ -5916,14 +5924,29 @@ def main_page():
                         "Detected devices: {n}",
                     ).format(n=len(devices))
                 else:
-                    direct_device_status.text = translate(
-                        "panel.connection.settings.internal.device.none",
-                        "No devices detected.",
-                    )
+                    env_args = os.environ.get('MESHSTATION_DEVICE_ARGS', '').strip()
+                    if env_args:
+                        direct_device_status.text = translate(
+                            "panel.connection.settings.internal.device.none_env",
+                            "No local USB devices — Auto uses the deployment SDR: {args}",
+                        ).format(args=env_args)
+                    else:
+                        direct_device_status.text = translate(
+                            "panel.connection.settings.internal.device.none",
+                            "No devices detected.",
+                        )
 
             options = {
                 "": translate("panel.connection.settings.internal.device.auto", "Auto (first detected)"),
             }
+            env_args = os.environ.get('MESHSTATION_DEVICE_ARGS', '').strip()
+            if env_args:
+                options[""] = translate(
+                    "panel.connection.settings.internal.device.auto_env",
+                    "Auto — deployment SDR ({args})",
+                ).format(args=env_args)
+                options[env_args] = f"{env_args} " + translate(
+                    "panel.connection.settings.internal.device.env_tag", "(deployment SDR)")
             for dev_args, label in devices:
                 options[dev_args] = label
             state.direct_device_detected_args = list(options.keys())

@@ -1594,11 +1594,21 @@ def msb2lsb(msb):
 def parseAESKey(key_b64):
     try:
         # Default Key Handling
-        # If user enters "AQ==" (which is technically just 0x01), treat it as the Meshtastic Default Channel Key
-        if key_b64 in ["0", "NOKEY", "nokey", "NONE", "none", "HAM", "ham", "AQ==", "", "AA=="]:
-            key_b64 = "1PG7OiApB1nwvP+rz05pAQ==" # The actual default AES256 key
-        
+        if key_b64 in ["0", "NOKEY", "nokey", "NONE", "none", "HAM", "ham", "", "AA=="]:
+            key_b64 = "1PG7OiApB1nwvP+rz05pAQ==" # The actual default key
+
         decoded = base64.b64decode(key_b64)
+        if len(decoded) == 1:
+            # Meshtastic "simple PSK" (AQ==..Cg==, i.e. 0x01..0x0A): the
+            # default key with its last byte offset by (n-1). AQ== (1) is the
+            # default key itself; BQ== (5) is default key with last byte +4.
+            n = decoded[0]
+            if 1 <= n <= 10:
+                key = bytearray(base64.b64decode("1PG7OiApB1nwvP+rz05pAQ=="))
+                key[-1] = (key[-1] + (n - 1)) & 0xFF
+                return bytes(key)
+            log_to_console(f"Invalid simple PSK index: {n}. Using default.")
+            return base64.b64decode("1PG7OiApB1nwvP+rz05pAQ==")
         if len(decoded) not in [16, 32]: # 128 or 256 bit
              log_to_console(f"Invalid Key Length: {len(decoded)}. Using default.")
              return base64.b64decode("1PG7OiApB1nwvP+rz05pAQ==")

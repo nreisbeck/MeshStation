@@ -236,3 +236,49 @@ Se il progetto ti sembra utile o interessante:
 - Condividilo con la community Meshtastic e SDR
 - Valuta di supportarne lo sviluppo futuro
 
+
+---
+
+## Fork additions (nreisbeck/MeshStation)
+
+This fork adds, on top of upstream v1.1.1:
+
+### Docker / docker-compose (headless web UI)
+
+```sh
+docker compose up -d    # then open http://localhost:8080
+```
+
+`MESHSTATION_WEB=1` serves the same nicegui UI to a plain browser — no native
+window or desktop libraries. The image reuses the official release's GNU Radio
+engine runtime (arm64 and amd64). Settings persist in the `meshstation-data`
+volume. See `Dockerfile` / `docker-compose.yml`; env vars:
+
+| Variable | Purpose |
+|---|---|
+| `MESHSTATION_WEB` | serve UI over HTTP instead of a native window |
+| `MESHSTATION_HOST` / `MESHSTATION_PORT` | bind address / port (default 0.0.0.0:8080) |
+| `MESHSTATION_DEVICE_ARGS` | SDR used when none selected, e.g. `rtl_tcp=pi:1234` |
+| `MESHSTATION_DEFAULT_REGION` / `_PRESET` | fresh-install defaults |
+
+### Networked SDRs
+
+The SDR Device selector accepts typed osmosdr device args (e.g.
+`rtl_tcp=host:1234`, SoapySDR remotes) in addition to scanned USB devices —
+run the radio wherever the antenna is best and decode anywhere.
+
+### Custom modem settings
+
+Internal tab → "Custom modem settings (advanced)": explicit frequency /
+bandwidth / spreading factor / coding rate for meshes that don't use a
+standard Meshtastic preset. Example — [MeshOregon](https://meshoregon.com):
+918.5 MHz, BW 125, SF 8, CR 4/5, primary channel `MeshOregon` with PSK
+`AQ==` (set the channel name in the default channel settings).
+
+### MeshCore (experimental first pass)
+
+Protocol selector supports [MeshCore](https://meshcore.co.uk): tunes to the
+community defaults (US 910.525 MHz BW250 SF10, EU 869.525 MHz BW250 SF11 —
+other regions via custom modem settings) and decodes packet headers, routing
+path, and full adverts (node name, role, location, public key) to the console
+log and RX stats. Map integration and encrypted payloads are not yet handled.

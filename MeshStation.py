@@ -5460,6 +5460,10 @@ def main_page():
         status_label = ui.label(translate("status.disconnected", "Disconnected")).classes('text-red-500 font-bold mr-4 self-center')
         global status_label_ref
         status_label_ref = status_label
+        # Sync the fresh label to the actual connection state: in web mode the
+        # page (and this label) is rebuilt on every browser load, which can
+        # happen while a connection is already up
+        set_connection_status_ui(bool(getattr(state, 'connected', False)), getattr(state, 'connect_mode', None))
         
 
     if not user_language_from_config:

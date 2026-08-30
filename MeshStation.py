@@ -477,6 +477,15 @@ def meshcore_normalize_channel_key(text: str) -> bytes | None:
         pass
     return None
 
+def meshcore_derive_hashtag_key(room_name: str) -> bytes:
+    """MeshCore hashtag channel key: first 16 bytes of SHA256 of the room
+    name, hashed including the leading '#' (e.g. '#hiking')."""
+    import hashlib as _hashlib
+    name = (room_name or "").strip()
+    if not name.startswith("#"):
+        name = "#" + name
+    return _hashlib.sha256(name.encode("utf-8")).digest()[:16]
+
 _meshcore_seen_msgs = deque(maxlen=256)
 
 def meshcore_route_group_text(grp: dict) -> bool:
@@ -8416,7 +8425,9 @@ def main_page():
                             ).classes('w-full mb-1')
                             if is_meshcore:
                                 ui.label(translate('channel.add.name.hint.meshcore',
-                                    'Display name only — MeshCore channels are identified by their secret key, not the name.')).classes('text-xs text-gray-400 mb-2')
+                                    'Hashtag channels: name the channel e.g. "#hiking" and leave the key blank — '
+                                    'the key derives from the name (SHA256). Otherwise the name is a display label '
+                                    'only; the secret key identifies the channel.')).classes('text-xs text-gray-400 mb-2')
                             else:
                                 ui.label(translate('channel.add.name.hint', 'Used to match incoming packets (djb2 hash of name)')).classes('text-xs text-gray-400 mb-2')
 
@@ -8433,12 +8444,13 @@ def main_page():
                                     except Exception:
                                         _existing_key = existing.get('key_b64', '')
                                 key_input = ui.input(
-                                    translate('channel.add.key.meshcore', 'Secret Key (hex)'),
+                                    translate('channel.add.key.meshcore', 'Secret Key (hex) — blank for hashtag channels'),
                                     value=_existing_key
                                 ).classes('w-full mb-1')
                                 ui.label(translate('channel.add.key.meshcore.hint',
                                     "As shown in MeshCore clients (32 hex characters); base64 (T-Deck style) also accepted. "
-                                    "Public channel: 8b3387e9c5cdea6ac9e5edbaa115cd72 — already monitored by default.")).classes('text-xs text-gray-400 mb-2')
+                                    "Blank + a #name derives the hashtag-channel key automatically. The well-known Public "
+                                    "channel key is built in and always monitored.")).classes('text-xs text-gray-400 mb-2')
                             else:
                                 key_input = ui.input(
                                     translate('channel.add.key', 'AES Key (Base64)'),
@@ -8455,10 +8467,16 @@ def main_page():
                                     return
                                 lbl = label_input.value.strip() or name
                                 if is_meshcore:
-                                    key_bytes = meshcore_normalize_channel_key(key_input.value)
+                                    kv = (key_input.value or '').strip()
+                                    if not kv and name.startswith('#'):
+                                        # Hashtag channel: key derives from the name
+                                        key_bytes = meshcore_derive_hashtag_key(name)
+                                    else:
+                                        key_bytes = meshcore_normalize_channel_key(kv)
                                     if key_bytes is None:
                                         ui.notify(translate('channel.add.error.badkey.meshcore',
-                                            'Invalid MeshCore key: expected 32 hex characters (or base64 of 16 bytes)'), color='negative')
+                                            'Invalid MeshCore key: expected 32 hex characters (or base64 of 16 bytes) — '
+                                            'or name the channel "#something" and leave the key blank'), color='negative')
                                         return
                                     key = base64.b64encode(key_bytes).decode()
                                 else:

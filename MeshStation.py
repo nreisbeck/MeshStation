@@ -293,6 +293,126 @@ PRESET_ID_MAP = {
     10: "VERY_LONG_SLOW",
 }
 PRESET_ID_REVERSE = {v: k for k, v in PRESET_ID_MAP.items() if v is not None}
+
+# ---------------------------------------------------------------------------
+# MeshCore (https://meshcore.co.uk) — first-pass support.
+# MeshCore is a different mesh protocol that also rides on LoRa. These are the
+# community default radio parameters per region; other regions can use the
+# custom modem settings. Packet format reference:
+# https://github.com/meshcore-dev/MeshCore/blob/main/docs/packet_structure.md
+MESHCORE_REGION_DEFAULTS = {
+    # region_key: (freq_mhz, bw_khz, sf, cr)
+    "US":     (910.525, 250.0, 10, 5),
+    "EU_868": (869.525, 250.0, 11, 5),
+}
+MESHCORE_ROUTE_TYPES = {0: "TRANS_FLOOD", 1: "FLOOD", 2: "DIRECT", 3: "TRANS_DIRECT"}
+MESHCORE_PAYLOAD_TYPES = {
+    0: "REQ", 1: "RESP", 2: "TXT_MSG", 3: "ACK", 4: "ADVERT", 5: "GRP_TXT",
+    6: "GRP_DATA", 7: "ANON_REQ", 8: "PATH", 9: "TRACE", 10: "MULTIPART",
+    11: "CONTROL", 15: "RAW_CUSTOM",
+}
+MESHCORE_DEVICE_ROLES = {0: "Unknown", 1: "ChatNode", 2: "Repeater", 3: "RoomServer", 4: "Sensor"}
+
+def meshcore_parse_packet(data: bytes) -> dict:
+    """Parse a raw MeshCore packet (first pass: header, path, and advert
+    payloads; other payload types are identified but not decoded).
+
+    Layout: header(1) [transport codes(4)] path_len(1) path(N) payload.
+    Header: bits 0-1 route type, 2-5 payload type, 6-7 version.
+    Path length byte: bits 6-7 hash size selector, 0-5 hop count.
+    """
+    out = {"valid": False, "error": None}
+    try:
+        if len(data) < 2:
+            out["error"] = "too short"
+            return out
+        header = data[0]
+        route_type = header & 0x03
+        payload_type = (header >> 2) & 0x0F
+        out["route_type"] = MESHCORE_ROUTE_TYPES.get(route_type, str(route_type))
+        out["payload_type"] = MESHCORE_PAYLOAD_TYPES.get(payload_type, f"0x{payload_type:x}")
+        out["version"] = (header >> 6) & 0x03
+        off = 1
+        if route_type in (0, 3):  # transport flood/direct carry region codes
+            if len(data) < off + 4:
+                out["error"] = "too short for transport codes"
+                return out
+            out["transport_codes"] = (
+                data[off] | (data[off + 1] << 8),
+                data[off + 2] | (data[off + 3] << 8),
+            )
+            off += 4
+        if len(data) < off + 1:
+            out["error"] = "too short for path length"
+            return out
+        path_len_byte = data[off]
+        hash_size = ((path_len_byte >> 6) & 0x03) + 1
+        hop_count = path_len_byte & 0x3F
+        if hash_size == 4:
+            out["error"] = "reserved path hash size"
+            return out
+        off += 1
+        path_bytes_len = hop_count * hash_size
+        if len(data) < off + path_bytes_len:
+            out["error"] = "too short for path data"
+            return out
+        out["hops"] = hop_count
+        out["path"] = [
+            data[off + i * hash_size:off + (i + 1) * hash_size].hex()
+            for i in range(hop_count)
+        ]
+        off += path_bytes_len
+        payload = data[off:]
+        out["payload_len"] = len(payload)
+
+        if payload_type == 0x04 and len(payload) >= 101:  # ADVERT
+            pubkey = payload[0:32]
+            timestamp = int.from_bytes(payload[32:36], "little")
+            flags = payload[100]
+            adv = {
+                "public_key": pubkey.hex(),
+                "timestamp": timestamp,
+                "role": MESHCORE_DEVICE_ROLES.get(flags & 0x0F, str(flags & 0x0F)),
+            }
+            p = 101
+            if flags & 0x10 and len(payload) >= p + 8:  # HasLocation
+                lat = int.from_bytes(payload[p:p + 4], "little", signed=True) / 1e6
+                lon = int.from_bytes(payload[p + 4:p + 8], "little", signed=True) / 1e6
+                adv["location"] = (lat, lon)
+                p += 8
+            if flags & 0x20:  # HasFeature1
+                p += 2
+            if flags & 0x40:  # HasFeature2
+                p += 2
+            if flags & 0x80 and len(payload) > p:  # HasName
+                try:
+                    adv["name"] = payload[p:].decode("utf-8", errors="replace").split("\0")[0]
+                except Exception:
+                    pass
+            out["advert"] = adv
+        out["valid"] = True
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+def meshcore_packet_summary(mc: dict) -> str:
+    if not mc.get("valid"):
+        return f"unparsed ({mc.get('error')})"
+    parts = [f"{mc.get('payload_type')} [{mc.get('route_type')}]"]
+    adv = mc.get("advert")
+    if adv:
+        name = adv.get("name") or adv["public_key"][:12] + "…"
+        parts.append(f"\"{name}\" ({adv.get('role')})")
+        loc = adv.get("location")
+        if loc:
+            parts.append(f"loc={loc[0]:.5f},{loc[1]:.5f}")
+    hops = mc.get("hops")
+    if hops is not None:
+        parts.append(f"hops={hops}")
+    parts.append(f"{mc.get('payload_len', 0)}B payload")
+    return " | ".join(parts)
+
 PRESET_COLORS = {
     "LONG_FAST":      "#22c55e",  # green
     "MEDIUM_FAST":    "#3b82f6",  # blue
@@ -939,6 +1059,8 @@ class AppState:
         self.direct_channel_name = ""         # "" = use default name of the preset
         self.direct_ppm = 0
         self.direct_gain = 30
+        # Protocol decoded from the LoRa frames: MESHTASTIC or MESHCORE
+        self.direct_protocol = "MESHTASTIC"
         # Custom modem settings: override region/preset radio parameters
         # entirely (e.g. MeshOregon: 918.5 MHz, BW 125, SF 8, CR 5)
         self.direct_custom_enabled = False
@@ -1707,6 +1829,9 @@ def load_user_config():
         else:
             # Unknown but non-empty: store as-is, engine will validate
             s.direct_device_args = tv
+    v = data.get("direct_protocol")
+    if isinstance(v, str) and v.upper() in ("MESHTASTIC", "MESHCORE"):
+        s.direct_protocol = v.upper()
     v = data.get("direct_custom_enabled")
     if isinstance(v, bool):
         s.direct_custom_enabled = v
@@ -1818,6 +1943,7 @@ def save_user_config():
             "direct_ppm": state.direct_ppm,
             "direct_gain": state.direct_gain,
             "direct_device_args": getattr(state, "direct_device_args", "rtl=0"),
+            "direct_protocol": getattr(state, "direct_protocol", "MESHTASTIC"),
             "direct_custom_enabled": getattr(state, "direct_custom_enabled", False),
             "direct_custom_freq_mhz": getattr(state, "direct_custom_freq_mhz", 918.5),
             "direct_custom_bw_khz": getattr(state, "direct_custom_bw_khz", 125.0),
@@ -2569,6 +2695,28 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                 frame_preset_id = body[preset_id_off] if len(body) > preset_id_off else 0
                 frame_preset_name = PRESET_ID_MAP.get(frame_preset_id)
 
+                # MeshCore mode: different packet format entirely — parse and
+                # log (first pass: adverts fully decoded, others identified)
+                if getattr(state, "direct_protocol", "MESHTASTIC") == "MESHCORE":
+                    mc = meshcore_parse_packet(payload)
+                    if mc.get("valid"):
+                        mesh_stats.on_frame_ok()
+                    else:
+                        mesh_stats.on_frame_fail()
+                    sender_label = None
+                    adv = mc.get("advert")
+                    if adv:
+                        sender_label = "!" + adv["public_key"][:8]
+                    try:
+                        mesh_stats.on_packet_received(sender_label, mc.get("hops"), snr_val, rssi_val)
+                    except Exception:
+                        pass
+                    metrics = ""
+                    if snr_val is not None:
+                        metrics = f" | SNR {snr_val:.1f} RSSI {rssi_val:.0f}"
+                    log_to_console(f"[MESHCORE] {meshcore_packet_summary(mc)}{metrics}")
+                    continue
+
                 # 1) Extract Meshtastic fields
                 extracted = dataExtractor(payload.hex())
 
@@ -3208,6 +3356,28 @@ def start_engine_direct():
         log_to_console(
             f"[ENGINE] Custom modem: {custom_calc['center_freq_mhz']:.3f} MHz, "
             f"BW {custom_calc['bw_khz']:.1f} kHz, SF{custom_calc['sf']}, CR4/{custom_calc['cr']}"
+        )
+    elif getattr(state, "direct_protocol", "MESHTASTIC") == "MESHCORE":
+        mc = MESHCORE_REGION_DEFAULTS.get(region)
+        if not mc:
+            msg = (f"No MeshCore defaults known for region {region}. "
+                   "Enable custom modem settings to set frequency/BW/SF manually.")
+            log_to_console(f"[ENGINE] {msg}")
+            show_engine_error_dialog(msg)
+            return
+        freq_mhz, bw_khz, sf, cr = mc
+        primary_calc = {
+            "center_freq_hz": int(round(freq_mhz * 1_000_000)),
+            "center_freq_mhz": freq_mhz,
+            "bw_khz": bw_khz,
+            "sf": sf,
+            "cr": cr,
+            "channel_name": "",
+        }
+        primary_key, primary_preset_id = "MESHCORE", 0
+        valid_configs = []
+        log_to_console(
+            f"[ENGINE] MeshCore ({region}): {freq_mhz:.3f} MHz, BW {bw_khz:.0f} kHz, SF{sf}, CR4/{cr}"
         )
     # --- Build preset configs (unified: single or ALL) ---
     else:
@@ -5428,6 +5598,18 @@ def main_page():
                                         "⚠ Enable only if you know what you are doing!\nThis powers the antenna port (Bias-T).\nConnecting unsupported hardware may damage your SDR or antenna."
                                     )
                                 ).classes('whitespace-pre-line')
+                            # Protocol select (Meshtastic / MeshCore first pass)
+                            ui.select(
+                                options={
+                                    "MESHTASTIC": "Meshtastic",
+                                    "MESHCORE": translate(
+                                        "panel.connection.settings.internal.option.meshcore",
+                                        "MeshCore (experimental: adverts decoded, console log only)"),
+                                },
+                                value=getattr(state, 'direct_protocol', 'MESHTASTIC'),
+                                on_change=lambda e: (setattr(state, 'direct_protocol', str(e.value or 'MESHTASTIC')), save_user_config()),
+                                label=translate("panel.connection.settings.internal.label.protocol", "Protocol"),
+                            ).props('dense options-dense').classes('w-full mb-0')
                             region_options = {k: f"{k} — {v['description']}" for k, v in MESHTASTIC_REGIONS.items() if k != "UNSET"}
                             # Region select
                             ui.select(
@@ -5479,6 +5661,23 @@ def main_page():
                                 freq_info_label = ui.label("").classes('text-xs text-gray-500')
                                 freq_info_warning = ui.label("").classes('text-xs text-orange-500 hidden')
                             def _update_freq_info():
+                                if (getattr(state, 'direct_protocol', 'MESHTASTIC') == 'MESHCORE'
+                                        and not getattr(state, 'direct_custom_enabled', False)):
+                                    mc = MESHCORE_REGION_DEFAULTS.get(state.direct_region)
+                                    if mc:
+                                        freq_info_label.text = (
+                                            f"→ MeshCore: {mc[0]:.3f} MHz | BW {mc[1]:.0f}kHz SF{mc[2]} CR4/{mc[3]}"
+                                        )
+                                        freq_info_label.classes(remove='text-red-500 text-gray-500', add='text-orange-500')
+                                    else:
+                                        freq_info_label.text = (
+                                            f"⚠ No MeshCore defaults for region {state.direct_region} — "
+                                            "use custom modem settings"
+                                        )
+                                        freq_info_label.classes(remove='text-gray-500 text-orange-500', add='text-red-500')
+                                    freq_info_warning.text = ""
+                                    freq_info_warning.classes(add='hidden')
+                                    return
                                 if getattr(state, 'direct_custom_enabled', False):
                                     freq_info_label.text = (
                                         f"→ CUSTOM: {float(state.direct_custom_freq_mhz):.3f} MHz | "
